@@ -51,7 +51,7 @@
                 } else {
                     window.isAuthReady = false;
                 }
-                render(); // Re-render the app state
+                render(); // Re-render the app state after auth change
             });
 
             authenticateAndSetup();
@@ -445,7 +445,7 @@
                     </button>
                     ${!window.state.settings.isBookingOpen ? `
                         <p class="mt-8 text-xl font-bold text-red-400 p-3 bg-red-900/50 rounded-lg max-w-lg mx-auto">
-                            Bookings are currently closed by the Reuben's Coaching Staff.
+                            ⚠️ Booking is temporarily closed by the Reuben's Coaching Staff. Please check back later!
                         </p>
                     ` : ''}
                 </div>
@@ -1226,17 +1226,10 @@
 
         // Initial render on load
         window.onload = () => {
-            // Wait for Firebase Auth state to be ready before full render
-            if (!window.isAuthReady) {
-                 const checkAuth = setInterval(() => {
-                    if (window.isAuthReady) {
-                        clearInterval(checkAuth);
-                        render();
-                    }
-                 }, 100);
-            } else {
-                render();
-            }
+            // FIX: Call render unconditionally to ensure the basic HTML structure 
+            // and header are visible immediately, preventing a blank screen hang.
+            window.render();
+            // onAuthStateChanged will handle subsequent renders once data is loaded.
         };
     </script>
     <style>
