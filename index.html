@@ -1,0 +1,1288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reuben's Roblox Coaching</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter Font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap" rel="stylesheet">
+    <!-- Firebase Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, getDocs, runTransaction, arrayUnion, arrayRemove, writeBatch, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by the Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        if (firebaseConfig) {
+            window.app = initializeApp(firebaseConfig);
+            window.db = getFirestore(window.app);
+            window.auth = getAuth(window.app);
+
+            // Set debug log level for Firestore
+            setLogLevel('Debug');
+
+            // --- Authentication and Setup ---
+            const authenticateAndSetup = async () => {
+                try {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(window.auth, initialAuthToken);
+                        console.log("Signed in with custom token.");
+                    } else {
+                        await signInAnonymously(window.auth);
+                        console.log("Signed in anonymously.");
+                    }
+                } catch (error) {
+                    console.error("Firebase Auth Error:", error);
+                }
+            };
+
+            onAuthStateChanged(window.auth, (user) => {
+                window.userId = user ? user.uid : null;
+                if (user) {
+                    console.log("Auth State Changed. User ID:", window.userId);
+                    window.isAuthReady = true;
+                    // Start listeners only after auth is ready
+                    setupFirestoreListeners();
+                } else {
+                    window.isAuthReady = false;
+                }
+                render(); // Re-render the app state
+            });
+
+            authenticateAndSetup();
+        } else {
+            console.error("Firebase configuration is missing.");
+        }
+
+        // --- Global State and Utility Functions ---
+        window.state = {
+            view: 'home', // home, prices, booking, reviews, contact, admin_login, admin_panel
+            isAdminLoggedIn: false,
+            adminPassword: 'Reubeniscool',
+            bookings: [],
+            reviews: [],
+            settings: {
+                prices: {
+                    oneOnOne30: 10, oneOnOne60: 15,
+                    group30: 15, group60: 17,
+                    specialPackage: 20
+                },
+                sessionLengths: [30, 60],
+                maxGroupSize: 4,
+                cardPaymentsEnabled: false,
+                coachingDescription: "Level up in MM2, Prison Life (gun training), obbys, and more!",
+                links: { facebook: 'reuben hantsche', email: 'reubensrblxcoaching@gmail.com', discord: '' },
+                blockedDates: [], // Array of YYYY-MM-DD strings
+                isBookingOpen: true, // NEW: Global booking control
+            },
+            selectedBookingDate: new Date(),
+            calendarMonth: new Date().getMonth(),
+            calendarYear: new Date().getFullYear(),
+            message: null,
+            messageTimeout: null,
+        };
+
+        const userCollectionPath = (collectionName) => `/artifacts/${appId}/users/${window.userId}/${collectionName}`;
+        const publicCollectionPath = (collectionName) => `/artifacts/${appId}/public/data/${collectionName}`;
+        const publicDocPath = (collectionName, docId) => `/artifacts/${appId}/public/data/${collectionName}/${docId}`;
+
+        window.showMessage = (msg, type = 'success') => {
+            if (window.state.messageTimeout) clearTimeout(window.state.messageTimeout);
+            window.state.message = { msg, type };
+            render();
+            window.state.messageTimeout = setTimeout(() => {
+                window.state.message = null;
+                render();
+            }, 3000);
+        };
+
+        // --- Firestore Listeners ---
+        const setupFirestoreListeners = () => {
+            if (!window.isAuthReady) return;
+
+            // 1. Settings Listener
+            onSnapshot(doc(window.db, publicDocPath('settings', 'config')), (docSnap) => {
+                if (docSnap.exists()) {
+                    window.state.settings = { ...window.state.settings, ...docSnap.data() };
+                    // Ensure new field has a default if missing
+                    if (typeof window.state.settings.isBookingOpen === 'undefined') {
+                        window.state.settings.isBookingOpen = true;
+                    }
+                    console.log("Settings updated:", window.state.settings);
+                    render();
+                } else {
+                    // Initialize default settings if not exists
+                    setDoc(doc(window.db, publicDocPath('settings', 'config')), window.state.settings, { merge: true });
+                }
+            }, (error) => console.error("Settings Snapshot Error:", error));
+
+            // 2. Bookings Listener
+            onSnapshot(collection(window.db, publicCollectionPath('bookings')), (snapshot) => {
+                window.state.bookings = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                console.log("Bookings updated:", window.state.bookings);
+                render();
+            }, (error) => console.error("Bookings Snapshot Error:", error));
+
+            // 3. Reviews Listener
+            onSnapshot(query(collection(window.db, publicCollectionPath('reviews')), where("isApproved", "==", true)), (snapshot) => {
+                window.state.reviews = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                window.state.reviews.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)); // Sort by newest
+                console.log("Approved Reviews updated:", window.state.reviews);
+                render();
+            }, (error) => console.error("Reviews Snapshot Error:", error));
+
+            // 4. Admin Pending Reviews Listener (Only for admin view)
+            if (window.state.isAdminLoggedIn) {
+                onSnapshot(query(collection(window.db, publicCollectionPath('reviews')), where("isApproved", "==", false)), (snapshot) => {
+                    window.state.pendingReviews = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                    console.log("Pending Reviews updated:", window.state.pendingReviews);
+                    render();
+                }, (error) => console.error("Pending Reviews Snapshot Error:", error));
+
+                // 5. Admin Notes Listener (Private)
+                if (window.userId) {
+                     onSnapshot(doc(window.db, userCollectionPath('admin_data'), 'notes'), (docSnap) => {
+                        if (docSnap.exists()) {
+                            window.state.adminNotes = docSnap.data().notes || "";
+                            render();
+                        } else {
+                             setDoc(doc(window.db, userCollectionPath('admin_data'), 'notes'), { notes: "" }, { merge: true });
+                        }
+                    }, (error) => console.error("Admin Notes Snapshot Error:", error));
+                }
+            }
+        };
+
+        window.adminLogin = (password) => {
+            if (password === window.state.adminPassword) {
+                window.state.isAdminLoggedIn = true;
+                window.state.view = 'admin_panel';
+                setupFirestoreListeners(); // Re-trigger listeners to get admin-specific data
+                showMessage('Admin logged in successfully.', 'success');
+            } else {
+                showMessage('Incorrect password.', 'error');
+            }
+            render();
+        };
+
+        window.adminLogout = () => {
+            window.state.isAdminLoggedIn = false;
+            window.state.view = 'home';
+            showMessage('Admin logged out.', 'success');
+            render();
+        };
+
+        // --- Client-side Handlers ---
+
+        window.submitBooking = async (e) => {
+            e.preventDefault();
+            const form = e.target;
+            const dateStr = window.state.selectedBookingDate.toISOString().split('T')[0];
+            const paymentMethod = form.payment.value;
+            
+            // NEW: Check global booking status
+            if (!window.state.settings.isBookingOpen) {
+                 // UPDATED MESSAGE FOR SUBMIT ERROR
+                 showMessage("Booking is currently closed by the Reuben's Coaching Staff. Please check back later.", 'error');
+                 return;
+            }
+
+            if (window.state.settings.blockedDates.includes(dateStr)) {
+                 showMessage("This date is blocked by the admin. Please select another.", 'error');
+                 return;
+            }
+
+            const newBooking = {
+                parentName: form['parent-name'].value,
+                parentEmail: form['parent-email'].value,
+                childRoblox: form['roblox-username'].value,
+                game: form.game.value,
+                sessionType: form['session-type'].value,
+                sessionLength: parseInt(form['session-length'].value, 10),
+                device: form.device.value,
+                communication: form.communication.value,
+                paymentMethod: paymentMethod,
+                fbUsername: paymentMethod === 'cash' ? form['fb-username'].value : null,
+                date: dateStr,
+                time: form.time.value,
+                status: 'Pending',
+                notes: '',
+                paid: paymentMethod === 'card' ? false : 'Cash - Pending',
+                createdAt: Date.now(),
+            };
+
+            try {
+                await addDoc(collection(window.db, publicCollectionPath('bookings')), newBooking);
+                showMessage('Booking submitted successfully! Reuben will contact you soon.', 'success');
+                form.reset();
+            } catch (error) {
+                console.error("Error submitting booking:", error);
+                showMessage('Failed to submit booking. Please try again.', 'error');
+            }
+        };
+
+        window.submitReview = async (e) => {
+            e.preventDefault();
+            const form = e.target;
+
+            const newReview = {
+                name: form['review-name'].value,
+                rating: parseInt(form.rating.value, 10),
+                comment: form.comment.value,
+                isApproved: false, // Must be approved by admin
+                createdAt: Date.now(),
+            };
+
+            try {
+                await addDoc(collection(window.db, publicCollectionPath('reviews')), newReview);
+                showMessage('Review submitted! It will appear once approved by the admin.', 'success');
+                form.reset();
+            } catch (error) {
+                console.error("Error submitting review:", error);
+                showMessage('Failed to submit review.', 'error');
+            }
+        };
+
+        // --- Admin Handlers ---
+
+        window.toggleBlockDate = async (dateStr) => {
+            const isCurrentlyBlocked = window.state.settings.blockedDates.includes(dateStr);
+            const action = isCurrentlyBlocked ? arrayRemove(dateStr) : arrayUnion(dateStr);
+            const docRef = doc(window.db, publicDocPath('settings', 'config'));
+
+            try {
+                await updateDoc(docRef, {
+                    blockedDates: action
+                });
+                showMessage(isCurrentlyBlocked ? `Date ${dateStr} unblocked.` : `Date ${dateStr} blocked.`, 'success');
+            } catch (error) {
+                console.error("Error updating blocked dates:", error);
+                showMessage('Failed to update blocked dates.', 'error');
+            }
+        };
+
+        // NEW: Handler for global booking state
+        window.toggleBookingState = async (isOpen) => {
+            const docRef = doc(window.db, publicDocPath('settings', 'config'));
+            try {
+                await updateDoc(docRef, {
+                    isBookingOpen: isOpen
+                });
+                showMessage(isOpen ? 'Global Booking is now OPEN.' : 'Global Booking is now CLOSED.', 'success');
+            } catch (error) {
+                console.error("Error updating booking state:", error);
+                showMessage('Failed to update booking state.', 'error');
+            }
+        };
+
+
+        window.updateBookingStatus = async (id, field, value) => {
+            const docRef = doc(window.db, publicCollectionPath('bookings'), id);
+            try {
+                await updateDoc(docRef, { [field]: value });
+                showMessage(`Booking ${id} updated!`, 'success');
+            } catch (error) {
+                console.error("Error updating booking status:", error);
+                showMessage('Failed to update booking.', 'error');
+            }
+        };
+
+        window.deleteBooking = async (id) => {
+            // Confirmation removed to ensure button functionality
+            const docRef = doc(window.db, publicCollectionPath('bookings'), id);
+            try {
+                await deleteDoc(docRef);
+                showMessage(`Booking ${id} deleted!`, 'success');
+            } catch (error) {
+                console.error("Error deleting booking:", error);
+                showMessage('Failed to delete booking.', 'error');
+            }
+        };
+
+        window.toggleReviewApproval = async (id, isApproved) => {
+            const docRef = doc(window.db, publicCollectionPath('reviews'), id);
+            try {
+                await updateDoc(docRef, { isApproved: isApproved });
+                showMessage(`Review ${id} ${isApproved ? 'approved' : 'unapproved'}.`, 'success');
+            } catch (error) {
+                console.error("Error updating review approval:", error);
+                showMessage('Failed to update review.', 'error');
+            }
+        };
+
+        window.deleteReview = async (id) => {
+            // Confirmation removed to ensure button functionality
+            const docRef = doc(window.db, publicCollectionPath('reviews'), id);
+            try {
+                await deleteDoc(docRef);
+                showMessage(`Review ${id} deleted.`, 'success');
+            } catch (error) {
+                console.error("Error deleting review:", error);
+                showMessage('Failed to delete review.', 'error');
+            }
+        };
+
+        window.updateSettings = async (e) => {
+            e.preventDefault();
+            const form = e.target;
+            const docRef = doc(window.db, publicDocPath('settings', 'config'));
+            const newSettings = {
+                prices: {
+                    oneOnOne30: parseFloat(form['p-1v1-30'].value),
+                    oneOnOne60: parseFloat(form['p-1v1-60'].value),
+                    group30: parseFloat(form['p-grp-30'].value),
+                    group60: parseFloat(form['p-grp-60'].value),
+                    specialPackage: parseFloat(form['p-pkg'].value),
+                },
+                sessionLengths: [parseInt(form['sl-1'].value, 10), parseInt(form['sl-2'].value, 10)],
+                maxGroupSize: parseInt(form['max-group-size'].value, 10),
+                cardPaymentsEnabled: form['card-payments-toggle'].checked,
+                coachingDescription: form['coaching-desc'].value,
+                links: {
+                    facebook: form['link-fb'].value,
+                    email: form['link-email'].value,
+                    discord: form['link-discord'].value,
+                },
+                isBookingOpen: window.state.settings.isBookingOpen, // Retain global status
+            };
+
+            try {
+                await setDoc(docRef, newSettings, { merge: true });
+                showMessage('Settings updated successfully!', 'success');
+            } catch (error) {
+                console.error("Error updating settings:", error);
+                showMessage('Failed to update settings.', 'error');
+            }
+        };
+
+        window.updateAdminNotes = async (e) => {
+            const notes = e.target.value;
+            const docRef = doc(window.db, userCollectionPath('admin_data'), 'notes');
+            try {
+                await setDoc(docRef, { notes }, { merge: true });
+            } catch (error) {
+                console.error("Error updating admin notes:", error);
+            }
+        };
+
+
+        // --- Rendering Logic ---
+
+        const getNavItems = (isAdmin) => {
+            const base = ['home', 'prices', 'booking', 'reviews', 'contact'];
+            if (isAdmin) {
+                return [...base, 'admin_panel'];
+            }
+            return base;
+        };
+
+        const renderHeader = () => {
+            const isAdmin = window.state.isAdminLoggedIn;
+            const navItems = getNavItems(isAdmin);
+
+            return `
+                <header class="bg-purple-900/60 backdrop-blur-md sticky top-0 z-50 shadow-2xl shadow-indigo-500/50">
+                    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex flex-col sm:flex-row justify-between items-center">
+                        <h1 id="header-title" onclick="window.state.view = window.state.isAdminLoggedIn ? 'admin_panel' : 'admin_login'; render();"
+                            class="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-yellow-300 to-pink-500 cursor-pointer tracking-wider hover:scale-[1.02] transition duration-300">
+                            Reuben's Roblox Coaching
+                        </h1>
+                        <nav class="mt-4 sm:mt-0">
+                            <ul class="flex space-x-2 sm:space-x-4">
+                                ${navItems.map(item => `
+                                    <li>
+                                        <a href="#" onclick="window.state.view = '${item === 'admin_panel' ? 'admin_panel' : item}'; render();"
+                                           class="text-gray-200 hover:text-yellow-400 font-medium capitalize px-3 py-2 rounded-lg transition duration-200 ${window.state.view.startsWith(item) ? 'bg-indigo-700/50 text-yellow-300' : ''}">
+                                            ${item.replace('_', ' ')}
+                                        </a>
+                                    </li>
+                                `).join('')}
+                            </ul>
+                        </nav>
+                        ${isAdmin ? `<button onclick="window.adminLogout()" class="mt-4 sm:mt-0 text-sm px-3 py-1 bg-red-600/80 hover:bg-red-500 rounded-full text-white font-semibold">Logout</button>` : ''}
+                    </div>
+                </header>
+            `;
+        };
+
+        const renderMessage = () => {
+            if (!window.state.message) return '';
+            const { msg, type } = window.state.message;
+            const color = type === 'success' ? 'bg-green-600' : 'bg-red-600';
+            return `
+                <div id="popup-message" class="fixed bottom-5 right-5 z-50 p-4 rounded-xl shadow-2xl transition duration-500 ease-in-out transform scale-100 ${color} text-white font-bold">
+                    ${msg}
+                </div>
+            `;
+        };
+
+        const renderCard = (title, content) => {
+            return `
+                <div class="bg-purple-900/50 p-6 rounded-2xl shadow-xl border border-indigo-500/40 transform hover:scale-[1.02] transition duration-300">
+                    <h3 class="text-2xl font-bold text-yellow-300 mb-4 border-b border-indigo-400/50 pb-2">${title}</h3>
+                    ${content}
+                </div>
+            `;
+        };
+
+        const renderHome = () => {
+            return `
+                <div class="text-center py-20 px-4">
+                    <h2 class="text-5xl md:text-7xl font-extrabold text-white mb-6 animate-pulse">
+                        Level Up Your Roblox Game!
+                    </h2>
+                    <p class="text-2xl md:text-3xl font-light text-yellow-300 mb-10 italic">
+                        ${window.state.settings.coachingDescription}
+                    </p>
+                    <button onclick="window.state.view = 'booking'; render();"
+                            class="bg-gradient-to-r from-purple-600 to-pink-500 hover:from-purple-700 hover:to-pink-600 text-white font-bold py-4 px-10 rounded-full shadow-2xl shadow-pink-500/50 text-xl transition transform hover:scale-105">
+                        Book a Session Now
+                    </button>
+                    ${!window.state.settings.isBookingOpen ? `
+                        <p class="mt-8 text-xl font-bold text-red-400 p-3 bg-red-900/50 rounded-lg max-w-lg mx-auto">
+                            Bookings are currently closed by the Reuben's Coaching Staff.
+                        </p>
+                    ` : ''}
+                </div>
+            `;
+        };
+
+        const renderPrices = () => {
+            const p = window.state.settings.prices;
+            const content = `
+                <div class="grid md:grid-cols-3 gap-8 max-w-5xl mx-auto">
+                    ${renderCard('1-on-1 Coaching', `
+                        <ul class="space-y-3 text-lg text-gray-200">
+                            <li>30 minutes: <span class="text-yellow-400 font-bold">AUD$${p.oneOnOne30}</span></li>
+                            <li>60 minutes: <span class="text-yellow-400 font-bold">AUD$${p.oneOnOne60}</span></li>
+                        </ul>
+                    `)}
+                    ${renderCard(`Group Coaching (up to ${window.state.settings.maxGroupSize})`, `
+                        <ul class="space-y-3 text-lg text-gray-200">
+                            <li>30 minutes: <span class="text-yellow-400 font-bold">AUD$${p.group30}</span></li>
+                            <li>60 minutes: <span class="text-yellow-400 font-bold">AUD$${p.group60}</span></li>
+                        </ul>
+                    `)}
+                    ${renderCard('Special Package', `
+                        <ul class="space-y-3 text-lg text-gray-200">
+                            <li>4 Sessions Total</li>
+                            <li>Massive Discount!</li>
+                            <li>Price: <span class="text-pink-400 font-bold text-2xl">AUD$${p.specialPackage}</span></li>
+                        </ul>
+                    `)}
+                </div>
+                <p class="text-center mt-10 text-gray-400 text-sm">All prices are in AUD.</p>
+            `;
+            return `
+                <div class="py-12 px-4">
+                    <h2 class="text-4xl font-bold text-center text-white mb-10">Coaching Prices</h2>
+                    ${content}
+                </div>
+            `;
+        };
+
+        // --- Calendar Component ---
+        const getDaysInMonth = (month, year) => new Date(year, month + 1, 0).getDate();
+        const getFirstDayOfMonth = (month, year) => new Date(year, month, 1).getDay();
+        const getCalendarDateString = (day, month, year) => `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+
+        const isDateBlocked = (dateStr) => window.state.settings.blockedDates.includes(dateStr);
+        const isDatePast = (date) => date < new Date(new Date().setHours(0, 0, 0, 0));
+        const isDateOutOfRange = (date) => {
+            const endDate = new Date('2028-11-26');
+            return date > endDate;
+        };
+
+        const renderCalendar = (isBookingMode) => {
+            const { calendarMonth: month, calendarYear: year, selectedBookingDate } = window.state;
+            const daysInMonth = getDaysInMonth(month, year);
+            const firstDay = getFirstDayOfMonth(month, year);
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+
+            const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+            let dayCells = '';
+
+            // Empty cells for padding
+            for (let i = 0; i < firstDay; i++) {
+                dayCells += `<div class="p-2"></div>`;
+            }
+
+            for (let day = 1; day <= daysInMonth; day++) {
+                const currentDate = new Date(year, month, day);
+                const dateStr = getCalendarDateString(day, month, year);
+
+                let classes = 'p-2 rounded-lg text-center font-semibold transition cursor-pointer ';
+                const isBlocked = isDateBlocked(dateStr);
+                const isPast = isDatePast(currentDate);
+                const isSelected = selectedBookingDate && selectedBookingDate.getDate() === day && selectedBookingDate.getMonth() === month && selectedBookingDate.getFullYear() === year;
+                const isToday = currentDate.getTime() === today.getTime();
+                const isOutOfRange = isDateOutOfRange(currentDate);
+
+                if (isPast || isOutOfRange || (isBlocked && isBookingMode) || !window.state.settings.isBookingOpen) {
+                    classes += 'bg-gray-700/50 text-gray-500 line-through cursor-not-allowed';
+                } else if (isSelected) {
+                    classes += 'bg-pink-600 text-white shadow-lg shadow-pink-500/50 ring-2 ring-yellow-300';
+                } else if (isToday) {
+                    classes += 'bg-indigo-600/80 text-white hover:bg-indigo-500 ring-1 ring-white';
+                } else if (isBlocked && !isBookingMode) {
+                    // Admin view: blocked but selectable for unblocking
+                    classes += 'bg-red-700/80 text-white hover:bg-red-600';
+                } else {
+                    classes += 'bg-purple-700/50 text-gray-100 hover:bg-purple-600/80';
+                }
+
+                let bookingsCount = 0;
+                if (!isBookingMode) {
+                    bookingsCount = window.state.bookings.filter(b => b.date === dateStr).length;
+                }
+
+                let clickHandler = '';
+
+                if (isPast || isOutOfRange || !window.state.settings.isBookingOpen) {
+                    clickHandler = '';
+                } else if (isBookingMode) {
+                    if (isBlocked) {
+                        clickHandler = `showMessage('Reuben can not do this day. We apologize for any inconvenience. Please select a different date and time.', 'error');`;
+                    } else {
+                        clickHandler = `window.state.selectedBookingDate = new Date(${year}, ${month}, ${day}); render();`;
+                    }
+                } else { // Admin Mode
+                    clickHandler = `window.toggleBlockDate('${dateStr}');`;
+                }
+
+                dayCells += `
+                    <div class="${classes} relative group" onclick="${clickHandler}">
+                        ${day}
+                        ${bookingsCount > 0 ? `<span class="absolute top-0 right-0 h-2 w-2 bg-yellow-400 rounded-full animate-pulse"></span>` : ''}
+                        ${isBlocked ? `<span class="text-xs absolute bottom-0 right-0 text-red-300">BLOCKED</span>` : ''}
+                    </div>
+                `;
+            }
+
+            const monthName = new Date(year, month).toLocaleString('default', { month: 'long' });
+
+            const todayButton = new Date();
+            const endLimit = new Date('2028-11-26');
+
+            return `
+                <div class="bg-purple-900/50 p-6 rounded-2xl shadow-xl border border-indigo-500/40">
+                    <div class="flex justify-between items-center mb-4">
+                        <button onclick="window.state.calendarMonth--; if(window.state.calendarMonth < 0) { window.state.calendarMonth = 11; window.state.calendarYear--; } render();"
+                            class="text-white p-2 rounded-full hover:bg-indigo-700/50 transition">
+                            &larr;
+                        </button>
+                        <h4 class="text-xl font-bold text-yellow-300">${monthName} ${year}</h4>
+                        <button onclick="window.state.calendarMonth++; if(window.state.calendarMonth > 11) { window.state.calendarMonth = 0; window.state.calendarYear++; } render();"
+                            class="text-white p-2 rounded-full hover:bg-indigo-700/50 transition" ${new Date(year, month + 1) > endLimit ? 'disabled' : ''}>
+                            &rarr;
+                        </button>
+                    </div>
+                    <div class="grid grid-cols-7 gap-1">
+                        ${days.map(d => `<div class="text-center text-sm font-medium text-gray-400">${d}</div>`).join('')}
+                        ${dayCells}
+                    </div>
+                    <p class="text-xs text-center text-gray-400 mt-4">
+                        Calendar range: Today &rarr; Nov 26, 2028
+                        ${isBookingMode ? '' : `| Click a day to ${isBookingMode ? 'select' : 'toggle block/unblock'}`}
+                    </p>
+                </div>
+            `;
+        };
+
+        const renderBookingPage = () => {
+            const settings = window.state.settings;
+            const selectedDateStr = window.state.selectedBookingDate.toDateString();
+            const isCardEnabled = settings.cardPaymentsEnabled;
+            const isBookingOpen = settings.isBookingOpen;
+
+            return `
+                <div class="py-12 px-4 max-w-6xl mx-auto">
+                    <h2 class="text-4xl font-bold text-center text-white mb-10">Book Your Coaching Session</h2>
+                    
+                    ${!isBookingOpen ? `
+                        <div class="p-6 bg-red-900/70 border-l-4 border-red-400 rounded-lg mb-8 text-white font-semibold text-center text-lg">
+                            ⚠️ Booking is temporarily closed by the Reuben's Coaching Staff. Please check back later!
+                        </div>
+                    ` : ''}
+
+                    <div class="grid lg:grid-cols-2 gap-8">
+                        <div id="calendar-container">
+                            ${renderCalendar(true)}
+                        </div>
+                        <div class="bg-purple-900/50 p-6 rounded-2xl shadow-xl border border-indigo-500/40">
+                            <h3 class="text-xl font-bold text-yellow-300 mb-4">Selected Date: <span class="text-white">${selectedDateStr}</span></h3>
+                            <form id="booking-form" onsubmit="window.submitBooking(event)">
+                                <div class="space-y-4">
+                                    ${renderInput('Parent name', 'parent-name', 'text', '')}
+                                    ${renderInput('Parent email', 'parent-email', 'email', '')}
+                                    ${renderInput('Child’s Roblox Username', 'roblox-username', 'text', '')}
+
+                                    ${renderSelect('Game', 'game', ['MM2', 'Prison Life', 'Obbys', 'Other'])}
+                                    ${renderSelect('Session Type', 'session-type', ['1-on-1', 'Group'])}
+                                    ${renderSelect('Session Length (mins)', 'session-length', settings.sessionLengths)}
+                                    ${renderSelect('Device', 'device', ['PC', 'Mobile', 'Console', 'Tablet'])}
+                                    ${renderSelect('Communication', 'communication', ['Discord', 'Zoom', 'Other'])}
+
+                                    ${renderRadioGroup('Payment Method', 'payment', [
+                                        { value: 'card', label: 'Card (Coming Soon)' },
+                                        { value: 'cash', label: 'Cash/Arrangement' }
+                                    ], 'card', 'handlePaymentChange')}
+
+                                    <div id="fb-username-field" class="hidden">
+                                        ${renderInput('Facebook Username', 'fb-username', 'text', '')}
+                                        <p class="text-sm text-pink-300 mt-2">Reuben will contact you on Facebook to arrange a safe drop-off/exchange spot.</p>
+                                    </div>
+                                    <div id="card-message" class="${isCardEnabled ? 'hidden' : 'block'} p-3 bg-red-800/50 rounded-lg text-white font-semibold">
+                                        Card Payments Coming Soon 💳
+                                    </div>
+
+                                    ${renderInput('Time Slot', 'time', 'text', '', null, 'e.g., 4:30 PM')}
+
+                                </div>
+                                <button type="submit" ${!isBookingOpen ? 'disabled' : ''}
+                                    class="w-full mt-6 font-bold py-3 px-4 rounded-xl shadow-lg transition transform hover:scale-[1.01]
+                                    ${isBookingOpen ? 'bg-gradient-to-r from-green-500 to-teal-400 hover:from-green-600 hover:to-teal-500 text-white' : 'bg-gray-600 text-gray-400 cursor-not-allowed'}">
+                                    ${isBookingOpen ? 'Confirm Booking' : 'Booking Closed'}
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+            `;
+        };
+
+        window.handlePaymentChange = () => {
+            const radioButtons = document.querySelectorAll('input[name="payment"]');
+            const checkedButton = Array.from(radioButtons).find(input => input.checked);
+
+            if (!checkedButton) return;
+
+            const payment = checkedButton.value;
+            const fbField = document.getElementById('fb-username-field');
+            const cardMsg = document.getElementById('card-message');
+
+            if (payment === 'cash') {
+                fbField.classList.remove('hidden');
+                cardMsg.classList.add('hidden');
+            } else {
+                fbField.classList.add('hidden');
+                cardMsg.classList.remove('hidden');
+                if (!window.state.settings.cardPaymentsEnabled) {
+                     document.getElementById('card-message').innerHTML = 'Card Payments Coming Soon 💳';
+                }
+            }
+        };
+
+        const renderReviewsPage = () => {
+            const approvedReviews = window.state.reviews;
+
+            return `
+                <div class="py-12 px-4 max-w-4xl mx-auto">
+                    <h2 class="text-4xl font-bold text-center text-white mb-10">What Parents Say</h2>
+                    <div class="space-y-8 mb-12">
+                        ${approvedReviews.length > 0 ? approvedReviews.map(r => `
+                            <div class="bg-purple-900/50 p-6 rounded-2xl shadow-xl border border-yellow-500/40">
+                                <div class="flex justify-between items-center mb-3">
+                                    <span class="text-xl font-bold text-yellow-300">${r.name}</span>
+                                    <span class="text-2xl text-yellow-400">${'⭐'.repeat(r.rating)}</span>
+                                </div>
+                                <p class="text-gray-200 italic">${r.comment}</p>
+                                <p class="text-xs text-gray-400 mt-2 text-right">
+                                    Posted: ${new Date(r.createdAt).toLocaleDateString()}
+                                </p>
+                            </div>
+                        `).join('') : '<p class="text-center text-gray-400">No reviews approved yet. Be the first!</p>'}
+                    </div>
+
+                    <h3 class="text-3xl font-bold text-center text-white mb-6">Submit Your Review</h3>
+                    <form onsubmit="window.submitReview(event)" class="bg-purple-900/50 p-6 rounded-2xl shadow-xl border border-indigo-500/40">
+                        <div class="space-y-4">
+                            ${renderInput('Your Name', 'review-name', 'text', '')}
+                            ${renderSelect('Rating', 'rating', [1, 2, 3, 4, 5])}
+                            ${renderTextarea('Comment', 'comment', '')}
+                        </div>
+                        <button type="submit" class="w-full mt-6 bg-gradient-to-r from-indigo-500 to-teal-500 hover:from-indigo-600 hover:to-teal-600 text-white font-bold py-3 px-4 rounded-xl shadow-lg transition transform hover:scale-[1.01]">
+                            Submit Review
+                        </button>
+                    </form>
+                </div>
+            `;
+        };
+
+        const renderContactPage = () => {
+            const links = window.state.settings.links;
+            return `
+                <div class="py-12 px-4 max-w-xl mx-auto text-center">
+                    <h2 class="text-4xl font-bold text-white mb-8">Get In Touch!</h2>
+                    <div class="space-y-6 bg-purple-900/50 p-8 rounded-2xl shadow-xl border border-indigo-500/40">
+                        ${links.facebook ? renderContactLink('Facebook', links.facebook, 'Connect for cash payments or general questions.') : ''}
+                        ${links.email ? renderContactLink('Email', links.email, 'The best way to reach Reuben directly.', true) : ''}
+                        ${links.discord && links.discord !== '' ? renderContactLink('Discord', links.discord, 'Join the server for quick chats and community events.') : ''}
+                    </div>
+
+                    <div class="mt-12">
+                        <h3 class="text-2xl font-bold text-yellow-300 mb-4">FAQ</h3>
+                        <div class="space-y-4 text-left text-gray-200">
+                            ${renderFAQItem('What games do you coach?', 'MM2, Prison Life (gun training), obbys, and more! Just ask if your game is not listed.')}
+                            ${renderFAQItem('How long are sessions?', 'We offer 30-minute and 60-minute 1-on-1 or group sessions.')}
+                            ${renderFAQItem('Do I need Discord?', 'Discord is the preferred communication method, but Zoom or other options can be arranged during the booking process.')}
+                            ${renderFAQItem('How do group sessions work?', 'Group sessions are limited to four participants maximum, ensuring personalized attention. You can book for a pre-formed group or be matched with others if available.')}
+                            ${renderFAQItem('What if I need to cancel or reschedule?', 'Please contact Reuben directly via Facebook or email as soon as possible. Cancellations require 24 hours\' notice for a full refund or free reschedule.')}
+                            ${renderFAQItem('What is your availability?', 'You can check the live calendar on the Booking page. Dates marked with a line-through are blocked, and you can see available time slots on the form.')}
+                        </div>
+                    </div>
+                </div>
+            `;
+        };
+
+        // --- Admin Panel Views ---
+
+        const renderAdminNav = () => {
+            const adminViews = [
+                { key: 'admin_panel', label: 'Admin Dashboard' },
+                { key: 'admin_calendar', label: 'Calendar Manager' },
+                { key: 'admin_bookings', label: 'Booking Manager' },
+                { key: 'admin_payments', label: 'Payments Overview' },
+                { key: 'admin_reviews', label: 'Reviews Control' },
+                { key: 'admin_settings', label: 'Settings' },
+                { key: 'admin_notes', label: 'Admin Notes' },
+            ];
+
+            return `
+                <nav class="p-4 bg-purple-900/70 rounded-xl shadow-lg border border-indigo-600/50">
+                    <ul class="space-y-2">
+                        ${adminViews.map(v => `
+                            <li>
+                                <a href="#" onclick="window.state.view = '${v.key}'; render();"
+                                   class="block p-3 rounded-lg font-medium transition duration-200 text-gray-200 hover:bg-indigo-700/50 ${window.state.view === v.key ? 'bg-indigo-700/70 text-yellow-300' : ''}">
+                                    ${v.label}
+                                </a>
+                            </li>
+                        `).join('')}
+                    </ul>
+                </nav>
+            `;
+        };
+
+        const renderAdminCalendarManager = () => {
+            const selectedDateStr = window.state.selectedBookingDate.toISOString().split('T')[0];
+            const bookingsForDay = window.state.bookings.filter(b => b.date === selectedDateStr);
+            const isBookingOpen = window.state.settings.isBookingOpen;
+
+            return `
+                <div class="space-y-6">
+                    <h3 class="text-3xl font-bold text-yellow-300 mb-6 border-b pb-2 border-indigo-400/50">Calendar Manager</h3>
+                    
+                    <div class="p-4 bg-purple-900/50 rounded-xl shadow-xl border border-pink-500/50">
+                        <h4 class="text-xl font-bold text-pink-300 mb-3">Global Booking Status Control</h4>
+                        <div class="flex space-x-4 items-center">
+                            <button onclick="window.toggleBookingState(false)"
+                                    class="px-6 py-3 rounded-xl font-bold text-white transition transform hover:scale-[1.02] ${!isBookingOpen ? 'bg-red-700 shadow-xl shadow-red-500/50' : 'bg-red-500 hover:bg-red-600'}">
+                                Close Booking
+                            </button>
+                            <button onclick="window.toggleBookingState(true)"
+                                    class="px-6 py-3 rounded-xl font-bold text-white transition transform hover:scale-[1.02] ${isBookingOpen ? 'bg-green-700 shadow-xl shadow-green-500/50' : 'bg-green-500 hover:bg-green-600'}">
+                                Open Booking
+                            </button>
+                            <p class="p-3 ${isBookingOpen ? 'text-green-300' : 'text-red-300'} font-extrabold border-l-4 border-current text-lg">
+                                Current Status: ${isBookingOpen ? 'OPEN' : 'CLOSED'}
+                            </p>
+                        </div>
+                        <p class="text-xs text-gray-400 mt-3">This controls the visibility and submission ability of the booking form site-wide.</p>
+                    </div>
+
+                    <div class="grid lg:grid-cols-2 gap-8">
+                        <div>
+                            ${renderCalendar(false)}
+                            <div class="mt-4 p-4 bg-red-900/50 border border-red-600 rounded-lg text-gray-200">
+                                <p class="font-bold">Admin Mode Instructions (Date Blocking):</p>
+                                <p>Click a day to toggle its blocked/greyed-out status. This prevents users from booking on that specific date.</p>
+                                <p>Currently Selected: <span class="text-yellow-300">${selectedDateStr}</span>. ${isDateBlocked(selectedDateStr) ? '<span class="text-red-300 font-bold">BLOCKED.</span>' : '<span class="text-green-300 font-bold">Available.</span>'}</p>
+                            </div>
+                        </div>
+
+                        <div class="bg-purple-900/50 p-6 rounded-2xl shadow-xl border border-indigo-500/40">
+                            <h4 class="text-xl font-bold text-white mb-4">Bookings for ${selectedDateStr}</h4>
+                            ${bookingsForDay.length > 0 ? bookingsForDay.map(b => `
+                                <div class="p-3 mb-3 border-b border-indigo-500/50 text-gray-200 text-sm">
+                                    <p class="font-bold text-yellow-300">${b.time} - ${b.parentName} (${b.childRoblox})</p>
+                                    <p>${b.sessionType} (${b.sessionLength} min) for ${b.game}</p>
+                                    <p>Status: <span class="font-semibold text-pink-300">${b.status}</span>, Paid: ${b.paid}</p>
+                                </div>
+                            `).join('') : '<p class="text-gray-400">No bookings for this date.</p>'}
+                        </div>
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderAdminBookingManager = () => {
+            const allBookings = window.state.bookings.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+            return `
+                <div class="space-y-6">
+                    <h3 class="text-3xl font-bold text-yellow-300 mb-6 border-b pb-2 border-indigo-400/50">Booking Manager (${allBookings.length} Total)</h3>
+                    <div class="overflow-x-auto bg-purple-900/50 p-4 rounded-xl shadow-xl">
+                        <table class="min-w-full divide-y divide-indigo-700/50">
+                            <thead>
+                                <tr class="text-white text-left text-xs uppercase tracking-wider">
+                                    <th class="p-3">Date/Time</th>
+                                    <th class="p-3">Client/Roblox</th>
+                                    <th class="p-3">Session</th>
+                                    <th class="p-3">Payment</th>
+                                    <th class="p-3">Status/Paid</th>
+                                    <th class="p-3">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-indigo-700/30">
+                                ${allBookings.map(b => `
+                                    <tr class="text-gray-200 hover:bg-purple-800/50 transition">
+                                        <td class="p-3 text-yellow-300 whitespace-nowrap">${b.date} @ ${b.time}</td>
+                                        <td class="p-3">
+                                            <p>${b.parentName} <span class="text-sm text-gray-400">(${b.parentEmail})</span></p>
+                                            <p class="text-pink-300 font-medium">Roblox: ${b.childRoblox}</p>
+                                            ${b.fbUsername ? `<p class="text-xs text-blue-300">FB: ${b.fbUsername}</p>` : ''}
+                                        </td>
+                                        <td class="p-3 whitespace-nowrap">${b.sessionType} (${b.sessionLength}m) for ${b.game}</td>
+                                        <td class="p-3 whitespace-nowrap">${b.paymentMethod} / ${b.device} / ${b.communication}</td>
+                                        <td class="p-3 whitespace-nowrap">
+                                            <select onchange="window.updateBookingStatus('${b.id}', 'status', this.value)" class="${b.status === 'Cancelled' ? 'bg-red-800' : b.status === 'Approved' ? 'bg-green-800' : 'bg-yellow-800'} rounded-md p-1 text-white text-sm">
+                                                <option value="Pending" ${b.status === 'Pending' ? 'selected' : ''}>Pending</option>
+                                                <option value="Approved" ${b.status === 'Approved' ? 'selected' : ''}>Approved</option>
+                                                <option value="Completed" ${b.status === 'Completed' ? 'selected' : ''}>Completed</option>
+                                                <option value="Cancelled" ${b.status === 'Cancelled' ? 'selected' : ''}>Cancelled</option>
+                                            </select>
+                                            <p class="mt-1">Paid: <span class="font-semibold text-white">${b.paid}</span></p>
+                                            <button onclick="window.updateBookingStatus('${b.id}', 'paid', true)" class="text-xs bg-green-500 hover:bg-green-600 p-1 rounded-full mt-1 text-white">Mark Paid</button>
+                                            <button onclick="window.updateBookingStatus('${b.id}', 'paid', 'Cash - Pending')" class="text-xs bg-red-500 hover:bg-red-600 p-1 rounded-full mt-1 text-white">Mark Unpaid</button>
+                                        </td>
+                                        <td class="p-3 space-y-1">
+                                            <textarea onblur="window.updateBookingStatus('${b.id}', 'notes', this.value)" class="w-full text-xs bg-gray-800 text-white p-1 rounded-md" placeholder="Add Notes">${b.notes || ''}</textarea>
+                                            <button onclick="window.deleteBooking('${b.id}')" class="text-xs bg-red-700 hover:bg-red-600 p-1 rounded-md text-white w-full">Delete</button>
+                                        </td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderAdminPaymentsOverview = () => {
+            const cashBookings = window.state.bookings.filter(b => b.paymentMethod === 'cash');
+            const cardBookings = window.state.bookings.filter(b => b.paymentMethod === 'card');
+
+            return `
+                <div class="space-y-8">
+                    <h3 class="text-3xl font-bold text-yellow-300 border-b pb-2 border-indigo-400/50">Payments Overview</h3>
+
+                    <div class="grid md:grid-cols-2 gap-6">
+                        ${renderCard('Cash Bookings', `
+                            <p class="text-sm text-pink-300 mb-4">Manual payment management for cash arrangements.</p>
+                            ${cashBookings.length > 0 ? cashBookings.map(b => `
+                                <div class="p-3 mb-2 bg-purple-800/50 rounded-lg">
+                                    <p class="font-bold text-white">${b.date} (${b.sessionType})</p>
+                                    <p class="text-sm text-gray-300">Client: ${b.parentName} (FB: ${b.fbUsername || 'N/A'})</p>
+                                    <div class="flex items-center space-x-2 mt-1">
+                                        <span class="text-sm">Paid:</span>
+                                        <input type="checkbox" ${b.paid === true ? 'checked' : ''} onchange="window.updateBookingStatus('${b.id}', 'paid', this.checked)">
+                                    </div>
+                                </div>
+                            `).join('') : '<p class="text-gray-400">No cash bookings yet.</p>'}
+                        `)}
+                        ${renderCard('Card Bookings', `
+                            <p class="text-sm text-pink-300 mb-4">Integrated card payments will appear here.</p>
+                            <p class="text-2xl font-bold text-teal-400">Card Payments ${window.state.settings.cardPaymentsEnabled ? 'Enabled' : 'Disabled'}</p>
+                            <div class="mt-4 space-y-3">
+                                ${cardBookings.length > 0 ? cardBookings.map(b => `
+                                    <div class="p-3 mb-2 bg-purple-800/50 rounded-lg">
+                                        <p class="font-bold text-white">${b.date} (${b.sessionType})</p>
+                                        <p class="text-sm text-gray-300">Client: ${b.parentName} (Waiting for Payment Provider)</p>
+                                    </div>
+                                `).join('') : '<p class="text-gray-400">No card bookings yet.</p>'}
+                                <p class="text-xs text-gray-400 mt-4">Note: The "Paid" status for card bookings is purely manual in this demo.</p>
+                            </div>
+                        `)}
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderAdminReviewsControl = () => {
+            const pendingReviews = window.state.pendingReviews || [];
+            const approvedReviews = window.state.reviews;
+
+            return `
+                <div class="space-y-8">
+                    <h3 class="text-3xl font-bold text-yellow-300 border-b pb-2 border-indigo-400/50">Reviews Control</h3>
+
+                    <div class="grid md:grid-cols-2 gap-6">
+                        ${renderCard(`Pending Reviews (${pendingReviews.length})`, `
+                            <p class="text-sm text-pink-300 mb-4">Reviews awaiting approval before being public.</p>
+                            ${pendingReviews.length > 0 ? pendingReviews.map(r => `
+                                <div class="p-3 mb-3 bg-yellow-900/50 rounded-lg border border-yellow-600/50">
+                                    <p class="font-bold text-white">${r.name} - ${'⭐'.repeat(r.rating)}</p>
+                                    <p class="text-sm text-gray-200 italic mt-1">${r.comment}</p>
+                                    <div class="flex space-x-2 mt-2">
+                                        <button onclick="window.toggleReviewApproval('${r.id}', true)" class="text-xs bg-green-600 hover:bg-green-500 p-1 rounded-md text-white">Approve</button>
+                                        <button onclick="window.deleteReview('${r.id}')" class="text-xs bg-red-600 hover:bg-red-500 p-1 rounded-md text-white">Delete</button>
+                                    </div>
+                                </div>
+                            `).join('') : '<p class="text-gray-400">No pending reviews.</p>'}
+                        `)}
+                        ${renderCard(`Approved Reviews (${approvedReviews.length})`, `
+                            <p class="text-sm text-pink-300 mb-4">Currently visible public reviews.</p>
+                            ${approvedReviews.length > 0 ? approvedReviews.map(r => `
+                                <div class="p-3 mb-3 bg-purple-800/50 rounded-lg border border-indigo-600/50">
+                                    <p class="font-bold text-white">${r.name} - ${'⭐'.repeat(r.rating)}</p>
+                                    <p class="text-sm text-gray-200 italic mt-1 truncate">${r.comment}</p>
+                                    <div class="flex space-x-2 mt-2">
+                                        <button onclick="window.toggleReviewApproval('${r.id}', false)" class="text-xs bg-yellow-600 hover:bg-yellow-500 p-1 rounded-md text-white">Unapprove</button>
+                                        <button onclick="window.deleteReview('${r.id}')" class="text-xs bg-red-600 hover:bg-red-500 p-1 rounded-md text-white">Delete</button>
+                                    </div>
+                                </div>
+                            `).join('') : '<p class="text-gray-400">No approved reviews.</p>'}
+                        `)}
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderAdminSettings = () => {
+            const s = window.state.settings;
+            return `
+                <div class="space-y-6">
+                    <h3 class="text-3xl font-bold text-yellow-300 border-b pb-2 border-indigo-400/50">Website Settings</h3>
+
+                    <form onsubmit="window.updateSettings(event)" class="bg-purple-900/50 p-6 rounded-2xl shadow-xl space-y-4">
+                        <h4 class="text-xl font-semibold text-pink-300">Pricing</h4>
+                        <div class="grid md:grid-cols-2 gap-4">
+                            ${renderInput('1-on-1 (30 min) Price (AUD$)', 'p-1v1-30', 'number', s.prices.oneOnOne30, 0.01)}
+                            ${renderInput('1-on-1 (60 min) Price (AUD$)', 'p-1v1-60', 'number', s.prices.oneOnOne60, 0.01)}
+                            ${renderInput('Group (30 min) Price (AUD$)', 'p-grp-30', 'number', s.prices.group30, 0.01)}
+                            ${renderInput('Group (60 min) Price (AUD$)', 'p-grp-60', 'number', s.prices.group60, 0.01)}
+                            ${renderInput('Special Package Price (AUD$)', 'p-pkg', 'number', s.prices.specialPackage, 0.01)}
+                            ${renderInput('Max Group Size', 'max-group-size', 'number', s.maxGroupSize, 1)}
+                            ${renderInput('Session Length 1 (mins)', 'sl-1', 'number', s.sessionLengths[0] || 30, 1)}
+                            ${renderInput('Session Length 2 (mins)', 'sl-2', 'number', s.sessionLengths[1] || 60, 1)}
+                        </div>
+
+                        <h4 class="text-xl font-semibold text-pink-300 pt-4 border-t border-indigo-700/50">General</h4>
+                        ${renderTextarea('Coaching Description/Subtitle', 'coaching-desc', s.coachingDescription)}
+
+                        <div class="flex items-center space-x-3 pt-2">
+                            <input type="checkbox" id="card-payments-toggle" name="card-payments-toggle" ${s.cardPaymentsEnabled ? 'checked' : ''} class="w-5 h-5 text-indigo-500 bg-gray-700 rounded border-gray-600 focus:ring-indigo-500">
+                            <label for="card-payments-toggle" class="text-white font-medium">Toggle "Card Payments Coming Soon" Message (Sets to Coming Soon)</label>
+                        </div>
+
+                        <h4 class="text-xl font-semibold text-pink-300 pt-4 border-t border-indigo-700/50">Contact Links</h4>
+                        ${renderInput('Facebook Link', 'link-fb', 'text', s.links.facebook)}
+                        ${renderInput('Email Address', 'link-email', 'email', s.links.email)}
+                        ${renderInput('Discord Link/Handle', 'link-discord', 'text', s.links.discord)}
+
+                        <button type="submit" class="w-full mt-6 bg-gradient-to-r from-teal-500 to-indigo-500 hover:from-teal-600 hover:to-indigo-600 text-white font-bold py-3 px-4 rounded-xl shadow-lg transition transform hover:scale-[1.01]">
+                            Save All Settings
+                        </button>
+                    </form>
+                </div>
+            `;
+        };
+
+        const renderAdminNotes = () => {
+            const notes = window.state.adminNotes || "Start typing your private notes here...";
+            return `
+                <div class="space-y-6">
+                    <h3 class="text-3xl font-bold text-yellow-300 border-b pb-2 border-indigo-400/50">Private Admin Notes</h3>
+                    <div class="bg-purple-900/50 p-6 rounded-2xl shadow-xl">
+                        <p class="text-sm text-pink-300 mb-4">These notes are private and only visible to logged-in admins (per user ID).</p>
+                        <textarea onblur="window.updateAdminNotes(event)"
+                                class="w-full h-80 bg-gray-800/80 text-white p-4 rounded-xl focus:ring-2 focus:ring-pink-500 placeholder-gray-500 resize-none"
+                                placeholder="Reminders, pre-paid clients list, session ideas...">
+                            ${notes}
+                        </textarea>
+                        <p class="text-xs text-gray-400 mt-2 text-right">Notes are saved automatically on blur/exit.</p>
+                    </div>
+                </div>
+            `;
+        }
+
+        const renderAdminPanel = () => {
+            if (!window.state.isAdminLoggedIn) {
+                return renderAdminLogin();
+            }
+
+            let mainContent = '';
+            switch (window.state.view) {
+                case 'admin_calendar':
+                    mainContent = renderAdminCalendarManager();
+                    break;
+                case 'admin_bookings':
+                    mainContent = renderAdminBookingManager();
+                    break;
+                case 'admin_payments':
+                    mainContent = renderAdminPaymentsOverview();
+                    break;
+                case 'admin_reviews':
+                    mainContent = renderAdminReviewsControl();
+                    break;
+                case 'admin_settings':
+                    mainContent = renderAdminSettings();
+                    break;
+                case 'admin_notes':
+                    mainContent = renderAdminNotes();
+                    break;
+                case 'admin_panel':
+                default:
+                    mainContent = `
+                        <div class="p-10 text-center bg-purple-900/50 rounded-2xl shadow-xl border border-indigo-500/40">
+                            <h3 class="text-4xl font-extrabold text-white">Welcome, Admin Reuben!</h3>
+                            <p class="text-lg text-yellow-300 mt-2">The Coaching Command Center.</p>
+                            <p class="text-gray-400 mt-4">Use the left navigation to manage bookings, payments, and website settings.</p>
+                            <div class="mt-6 text-sm text-gray-500">
+                                Your Canvas User ID: <span class="text-xs text-pink-500 break-all">${window.userId || 'Not Authenticated'}</span>
+                            </div>
+                        </div>
+                    `;
+                    break;
+            }
+
+            return `
+                <div class="py-12 px-4 max-w-7xl mx-auto">
+                    <h2 class="text-5xl font-extrabold text-center text-transparent bg-clip-text bg-gradient-to-r from-yellow-300 to-red-500 mb-10">
+                        Admin Panel
+                    </h2>
+                    <div class="grid lg:grid-cols-4 gap-8">
+                        <div class="lg:col-span-1">
+                            ${renderAdminNav()}
+                        </div>
+                        <div class="lg:col-span-3">
+                            ${mainContent}
+                        </div>
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderAdminLogin = () => {
+            return `
+                <div class="py-20 px-4 max-w-md mx-auto text-center">
+                    <h2 class="text-4xl font-bold text-white mb-8">Admin Login</h2>
+                    <div class="bg-purple-900/50 p-8 rounded-2xl shadow-xl border border-indigo-500/40">
+                        <form onsubmit="event.preventDefault(); window.adminLogin(document.getElementById('admin-password').value);">
+                            <label for="admin-password" class="block text-left text-gray-200 font-medium mb-2">Password:</label>
+                            <input type="password" id="admin-password" required
+                                   class="w-full bg-gray-800/80 text-yellow-300 p-3 rounded-lg border-2 border-indigo-600 focus:border-pink-500 placeholder-gray-500">
+                            <button type="submit" class="w-full mt-6 bg-gradient-to-r from-red-600 to-pink-500 hover:from-red-700 hover:to-pink-600 text-white font-bold py-3 px-4 rounded-xl shadow-lg transition transform hover:scale-[1.01]">
+                                Enter
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            `;
+        };
+
+        // --- HTML Utility Elements ---
+
+        // Updated renderInput to remove default placeholder text if not provided
+        const renderInput = (label, id, type, value = '', step = null, placeholder = '') => {
+            // Apply a default placeholder text if none is explicitly provided to maintain styles
+            const finalPlaceholder = placeholder === '' ? '' : placeholder;
+            return `
+                <div>
+                    <label for="${id}" class="block text-gray-200 font-medium mb-1">${label}</label>
+                    <input type="${type}" id="${id}" name="${id}" value="${value}" ${step ? `step="${step}"` : ''} required ${finalPlaceholder ? `placeholder="${finalPlaceholder}"` : ''}
+                           class="w-full bg-gray-800/80 text-yellow-300 p-3 rounded-lg border-2 border-indigo-600 focus:border-pink-500 placeholder-gray-500">
+                </div>
+            `;
+        };
+
+        // Updated renderTextarea to remove default placeholder text if not provided
+        const renderTextarea = (label, id, value = '', placeholder = '') => {
+            return `
+                <div>
+                    <label for="${id}" class="block text-gray-200 font-medium mb-1">${label}</label>
+                    <textarea id="${id}" name="${id}" rows="4" required ${placeholder ? `placeholder="${placeholder}"` : ''}
+                           class="w-full bg-gray-800/80 text-yellow-300 p-3 rounded-lg border-2 border-indigo-600 focus:border-pink-500 placeholder-gray-500 resize-none">${value}</textarea>
+                </div>
+            `;
+        };
+
+        const renderSelect = (label, id, options) => {
+            return `
+                <div>
+                    <label for="${id}" class="block text-gray-200 font-medium mb-1">${label}</label>
+                    <select id="${id}" name="${id}" required
+                            class="w-full bg-gray-800/80 text-yellow-300 p-3 rounded-lg border-2 border-indigo-600 focus:border-pink-500">
+                        ${options.map(opt => `<option value="${opt}">${opt}</option>`).join('')}
+                    </select>
+                </div>
+            `;
+        };
+
+        const renderRadioGroup = (label, name, options, defaultValue, onChangeFunc) => {
+            return `
+                <div class="py-2">
+                    <label class="block text-gray-200 font-medium mb-2">${label}</label>
+                    <div class="flex flex-wrap gap-4">
+                        ${options.map(opt => `
+                            <label class="inline-flex items-center text-gray-200">
+                                <input type="radio" name="${name}" value="${opt.value}" ${opt.value === defaultValue ? 'checked' : ''}
+                                       ${onChangeFunc ? `onchange="${onChangeFunc}()"` : ''}
+                                       class="w-4 h-4 text-pink-500 bg-gray-700 border-gray-600 focus:ring-pink-500">
+                                <span class="ml-2">${opt.label}</span>
+                            </label>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderContactLink = (label, href, description, isEmail = false) => {
+            const url = isEmail ? `mailto:${href}` : href;
+            // For Facebook, since it's a username, display the text clearly
+            const displayHref = isEmail ? href : (label === 'Facebook' ? `Username: ${href}` : href);
+
+            return `
+                <a href="${isEmail ? url : '#/contact'}" target="${isEmail ? '_blank' : '_self'}" 
+                    class="block p-4 rounded-xl bg-indigo-700/50 hover:bg-indigo-600/70 transition transform hover:scale-[1.02] shadow-lg border border-indigo-500/50">
+                    <h4 class="text-2xl font-bold text-yellow-300">${label}</h4>
+                    <p class="text-sm text-gray-300 mt-1">${description}</p>
+                    <p class="text-xs text-pink-300 break-all mt-1">${displayHref}</p>
+                </a>
+            `;
+        };
+
+        const renderFAQItem = (question, answer) => {
+            return `
+                <details class="group cursor-pointer bg-purple-800/50 p-4 rounded-lg">
+                    <summary class="flex justify-between items-center text-white font-semibold">
+                        ${question}
+                        <span class="transform group-open:rotate-180 transition-transform text-pink-400 text-xl">&#x25BC;</span>
+                    </summary>
+                    <p class="mt-2 pl-4 text-gray-300 border-l border-pink-400/50">${answer}</p>
+                </details>
+            `;
+        };
+
+
+        // --- Main Render Function ---
+        window.render = () => {
+            const appContainer = document.getElementById('app');
+            if (!appContainer) return;
+
+            let content = '';
+            switch (window.state.view) {
+                case 'prices':
+                    content = renderPrices();
+                    break;
+                case 'booking':
+                    content = renderBookingPage();
+                    break;
+                case 'reviews':
+                    content = renderReviewsPage();
+                    break;
+                case 'contact':
+                    content = renderContactPage();
+                    break;
+                case 'admin_login':
+                    content = renderAdminLogin();
+                    break;
+                case 'admin_panel':
+                case 'admin_calendar':
+                case 'admin_bookings':
+                case 'admin_payments':
+                case 'admin_reviews':
+                case 'admin_settings':
+                case 'admin_notes':
+                    content = renderAdminPanel();
+                    break;
+                case 'home':
+                default:
+                    content = renderHome();
+                    break;
+            }
+
+            appContainer.innerHTML = `
+                ${renderHeader()}
+                <main class="flex-grow p-4 min-h-screen">
+                    ${content}
+                </main>
+                ${renderMessage()}
+            `;
+
+            // Initial call to handlePaymentChange to set initial state for Booking form
+            if (window.state.view === 'booking') {
+                 // Defer running until DOM is updated
+                 setTimeout(window.handlePaymentChange, 0);
+            }
+        };
+
+        // Initial render on load
+        window.onload = () => {
+            // Wait for Firebase Auth state to be ready before full render
+            if (!window.isAuthReady) {
+                 const checkAuth = setInterval(() => {
+                    if (window.isAuthReady) {
+                        clearInterval(checkAuth);
+                        render();
+                    }
+                 }, 100);
+            } else {
+                render();
+            }
+        };
+    </script>
+    <style>
+        /* Custom Glowing/Star Cursor CSS */
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #0d0a1b; /* Dark Nebula Base */
+            background-image: radial-gradient(at 0% 0%, #1a162d 0%, transparent 50%),
+                              radial-gradient(at 100% 100%, #301948 0%, transparent 50%),
+                              url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100%25' height='100%25' viewBox='0 0 800 800'%3E%3Cg fill='none' stroke='%2334005C' stroke-width='1.7'%3E%3Cpath d='M769 229L1037 260.9M927 880L731 737 520 668 309 534 3 321 149 154 270 14 475 258 701 256'/%3E%3Ccircle cx='500' cy='500' r='40'/%3E%3Ccircle cx='500' cy='500' r='340'/%3E%3C/g%3E%3Cg fill='%2361007E' opacity='0.3'%3E%3Ccircle cx='400' cy='400' r='50'/%3E%3Ccircle cx='200' cy='600' r='20'/%3E%3Ccircle cx='600' cy='200' r='30'/%3E%3C/g%3E%3C/svg%3E") ;
+            background-attachment: fixed;
+            color: #ffffff;
+            cursor: url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='2' fill='%23FFD700' stroke='%23FF69B4' stroke-width='1' filter='url(%23glowing-star)'/%3E%3Cdefs%3E%3Cfilter id='glowing-star'%3E%3CfeGaussianBlur stdDeviation='1.5' result='coloredBlur'/%3E%3CfeMerge%3E%3CfeMergeNode in='coloredBlur'/%3E%3CfeMergeNode in='SourceGraphic'/%3E%3C/feMerge%3E%3C/filter%3E%3C/defs%3E%3C/svg%3E") 12 12, auto;
+        }
+
+        /* Ensure input text is readable (already handled in JS component but good as a fallback) */
+        input[type="text"], input[type="email"], input[type="password"], input[type="number"], input[type="url"], textarea, select {
+            color: #fcd34d; /* yellow-300 */
+        }
+        input::placeholder, textarea::placeholder {
+            color: #9ca3af; /* gray-400 */
+        }
+
+        /* Custom scrollbar for galaxy feel */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #1a162d;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #6d28d9; /* Indigo-700 */
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #ec4899; /* Pink-500 */
+        }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col">
+    <div id="app">
+        <!-- Content will be rendered here by JavaScript -->
+    </div>
+</body>
+</html>
